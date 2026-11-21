@@ -256,38 +256,85 @@ def xgboost(max_depth=3, learning_rate=0.1):
                         random_state=SEMILLA)
 
 
-# TODO: complete cada rejilla con dos a cuatro valores por hiperparámetro.
+# De dos a cuatro valores por hiperparámetro. El objetivo es la lluvia en mm,
+# sin escalar (desviación de unos 110 mm): en el SVR, C multiplica errores en
+# mm y epsilon es una tolerancia en mm, así que epsilon = 0.1 no tiene sentido
+# y se busca entre 1 y 30 mm.
+# Una primera rejilla (KNN 3-15 vecinos, SVR C 10-1000, Random Forest con
+# profundidad 3, 6 o sin límite, XGBoost con tasa 0.03-0.3) eligió en el borde
+# suave de tres modelos; esta la corre una vez hacia ese borde, decidiendo
+# solo con la validación. La validación sigue prefiriendo los modelos más
+# suaves (20 vecinos, árboles de profundidad 2, tasa 0.01): más allá de la
+# estacionalidad, la tabla trae poca señal que no sea ruido.
 REJILLAS = {
-    "KNN": (knn, {"n_neighbors": [5]}),
-    "SVR": (svr, {"C": [1.0], "epsilon": [0.1]}),
-    "Random Forest": (bosque, {"max_depth": [None], "min_samples_leaf": [1]}),
-    "XGBoost": (xgboost, {"max_depth": [3], "learning_rate": [0.1]}),
+    "KNN": (knn, {"n_neighbors": [5, 10, 15, 20]}),
+    "SVR": (svr, {"C": [1.0, 10.0, 100.0], "epsilon": [1.0, 10.0, 30.0]}),
+    "Random Forest": (bosque, {"max_depth": [2, 3, 6], "min_samples_leaf": [1, 3, 6]}),
+    "XGBoost": (xgboost, {"max_depth": [2, 3, 5], "learning_rate": [0.01, 0.03, 0.1]}),
 }
+# Validación temporal: cuatro cortes de 12 meses al final de la tabla previa
+# al backtest; el primero entrena con las 50 filas más antiguas.
+CORTES = TimeSeriesSplit(n_splits=4, test_size=12)
 
 
 def sin_prefijo(parametros):
     return {nombre.split("__")[-1]: valor for nombre, valor in parametros.items()}
 
 
-def ajustar_hiperparametros(serie):
-    """TODO: para cada modelo de REJILLAS, la combinación con menor RMSE en
-    validación temporal.
+def con_prefijo(fabrica, rejilla):
+    """KNN y SVR son make_pipeline: GridSearchCV nombra sus hiperparámetros
+    con el prefijo del paso (svr__C)."""
+    modelo = fabrica()
+    if not hasattr(modelo, "steps"):
+        return rejilla
+    paso = modelo.steps[-1][0]
+    return {f"{paso}__{nombre}": valores for nombre, valores in rejilla.items()}
 
-    Arme la tabla con serie.iloc[:-N_PRUEBA], para que ninguno de los meses
-    del backtest decida, y busque con GridSearchCV y TimeSeriesSplit. KNN y
-    SVR son make_pipeline: sus claves en la rejilla llevan el prefijo del paso
-    (kneighborsregressor__n_neighbors). Imprima lo elegido y su RMSE de
-    validación. Devuelva {nombre: {hiperparámetro: valor}}; sin_prefijo
-    quita el prefijo.
-    """
-    raise NotImplementedError("hiperparámetros con validación temporal")
+
+def ajustar_hiperparametros(serie):
+    """Para cada modelo de REJILLAS, la combinación con menor RMSE en la
+    validación temporal (CORTES), con la tabla de serie.iloc[:-N_PRUEBA]: los
+    24 meses del backtest no participan en la elección. Es el error a un mes,
+    con rezagos observados; el backtest después mide el recursivo a 12."""
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    print(f"  rejillas: {len(X)} filas ({X.index[0]:%Y-%m} a {X.index[-1]:%Y-%m}), "
+          f"{CORTES.get_n_splits()} cortes de {CORTES.test_size} meses")
+    elegidos = {}
+    for nombre, (fabrica, rejilla) in REJILLAS.items():
+        busqueda = GridSearchCV(fabrica(), con_prefijo(fabrica, rejilla), cv=CORTES,
+                                scoring="neg_root_mean_squared_error", n_jobs=1)
+        busqueda.fit(X, z)
+        elegidos[nombre] = sin_prefijo(busqueda.best_params_)
+        print(f"  {nombre}: {elegidos[nombre]}, RMSE de validación "
+              f"{-busqueda.best_score_:.1f}")
+    return elegidos
 
 
 def graficar_importancia(serie, elegidos):
-    """TODO: importancia de las variables de Random Forest y XGBoost
-    (feature_importances_), ajustados con lo elegido; guarde
-    figuras/importancia.png."""
-    raise NotImplementedError("importancia de variables")
+    """Importancia de las variables de Random Forest y XGBoost, ajustados con
+    lo elegido sobre la misma tabla de la elección (sin el backtest)."""
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    modelos = {nombre: REJILLAS[nombre][0](**elegidos[nombre]).fit(X, z)
+               for nombre in ("Random Forest", "XGBoost")}
+    importancias = pd.DataFrame({nombre: modelo.feature_importances_
+                                 for nombre, modelo in modelos.items()}, index=X.columns)
+    importancias = importancias.sort_values("Random Forest")
+    figura, ejes = plt.subplots(1, 2, figsize=(9, 4.4), sharex=True, sharey=True)
+    for eje, nombre in zip(ejes, importancias.columns):
+        eje.barh(importancias.index, importancias[nombre], color="#2a78d6", height=0.7)
+        eje.set_title(nombre, fontsize=10)
+        eje.set_xlabel("importancia (suma 1)")
+        eje.grid(axis="x", color="#e1e0d9", linewidth=0.8)
+        eje.set_axisbelow(True)
+        for lado in ("top", "right"):
+            eje.spines[lado].set_visible(False)
+    figura.suptitle("Importancia de las variables, con los hiperparámetros elegidos")
+    figura.tight_layout()
+    figura.savefig(FIGURAS / "importancia.png", dpi=120)
+    plt.close(figura)
+    print("  importancia (las tres primeras): " + "; ".join(
+        f"{nombre}: {', '.join(importancias[nombre].nlargest(3).index)}"
+        for nombre in importancias.columns))
 
 
 # ============================================================

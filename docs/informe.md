@@ -106,16 +106,90 @@ media y la desviación salen solo de los meses anteriores al origen.
 
 ## 3. Aprendizaje automático
 
-{{La rejilla de cada modelo, con qué datos y con qué validación temporal se
-eligió, y los hiperparámetros elegidos con su RMSE de validación. Por qué
-ninguno de los meses del *backtest* participa en la elección.}}
+**Cómo se eligieron los hiperparámetros.** Con `GridSearchCV` y
+`TimeSeriesSplit` sobre la tabla de `serie.iloc[:-24]`, es decir, las **98
+filas de 2016-01 a 2024-02**. Los 24 meses del *backtest* no participan en
+la elección: si decidieran, el *backtest* dejaría de ser una prueba y pasaría
+a ser parte del ajuste. La validación son **4 cortes de 12 meses** al final de
+esa tabla: el primero entrena con las 50 filas más antiguas y valida el año
+siguiente, y cada corte agrega un año. Nunca se valida con meses anteriores a
+los de entrenamiento. Se elige la combinación de menor RMSE promedio.
+
+Es el error **a un mes**, con rezagos observados. El *backtest* después mide
+el pronóstico recursivo a 12 meses, que es más difícil. Por eso los RMSE de
+validación (105 a 112 mm) son menores que los del *backtest* (131 a 150 mm).
+
+| Modelo | Rejilla | Elegido | RMSE de validación |
+|---|---|---|---|
+| KNN | `n_neighbors` ∈ {5, 10, 15, 20} | 20 vecinos | 112.0 |
+| SVR | `C` ∈ {1, 10, 100}, `epsilon` ∈ {1, 10, 30} mm | C = 10, ε = 10 mm | 107.7 |
+| Random Forest | `max_depth` ∈ {2, 3, 6}, `min_samples_leaf` ∈ {1, 3, 6} | profundidad 2, 3 por hoja | 108.6 |
+| XGBoost | `max_depth` ∈ {2, 3, 5}, `learning_rate` ∈ {0.01, 0.03, 0.1} | profundidad 5, tasa 0.01 | **105.7** |
+
+**Las rejillas.** En el SVR, el objetivo es la lluvia en mm sin escalar, así
+que $\varepsilon$ es una tolerancia en milímetros: el valor por defecto
+(0.1 mm) no tiene sentido y se buscó entre 1 y 30 mm. Una primera rejilla
+(KNN de 3 a 15 vecinos, SVR con C de 10 a 1000, Random Forest con
+profundidad 3, 6 o sin límite, XGBoost con tasa de 0.03 a 0.3) eligió en el
+**borde suave** de tres modelos. Se corrió una vez hacia ese borde,
+decidiendo solo con la validación, y la validación **siguió eligiendo lo más
+suave**: más vecinos, árboles más bajos y aprendizaje más lento. Es una
+señal de la serie, no de la rejilla: un modelo suave pronostica cerca del
+promedio de cada mes, y la validación lo prefiere porque, fuera de la
+estacionalidad, la tabla trae poca información que no sea ruido. Por eso no
+se siguió corriendo la rejilla, que habría terminado en "pronosticar el
+promedio".
 
 ![Importancia de las variables](../figuras/importancia.png)
 
-{{Qué variables pesan más en Random Forest y en XGBoost, y si coinciden con
-los rezagos que marcaba la PACF en el miniproyecto 1.}}
+**Qué variables pesan.** En los dos modelos, la primera es **`rezago_12`**,
+la lluvia del mismo mes del año anterior: 0.41 de la importancia en Random
+Forest y 0.20 en XGBoost. Le siguen:
 
-{{RMSE, MAE y MAPE de los cuatro modelos y cuál gana entre ellos.}}
+- en Random Forest, `rezago_3` (0.18) y luego `mes` y `rezago_9`, con 0.06
+  cada uno;
+- en XGBoost, que reparte más, `media_3` (0.11), `mes` (0.10) y `rezago_3`
+  (0.09).
+
+Coincide con la PACF del miniproyecto 1. Sobre $y_t - y_{t-12}$, la PACF
+salía de la banda en los rezagos 7, 12, 20 y 24, y la barra aislada en 12 es
+la que llevó al término estacional del SARIMA. Aquí `rezago_12` es,
+de lejos, lo que más usan los árboles. En cambio, **`rezago_7` es la variable
+menos usada por Random Forest** (0.009) y de las menos usadas por XGBoost
+(0.04). Eso respalda lo que se concluyó entonces: la barra en 7 probablemente
+es azar. Los rezagos 20 y 24 no están en la tabla, que llega hasta 12. Que
+`mes` y `media_3` pesen dice que los árboles también usan la temporada y el
+trimestre reciente, algo que el SARIMA no ve.
+
+**Resultados en el *backtest*** (13 orígenes, horizonte 1 a 12):
+
+| Modelo | RMSE | MAE | MAPE (%) | Parámetros |
+|---|---|---|---|---|
+| SARIMAX$(0,0,0)(0,1,1)_{12}$ + días del mes | **113.79** | **91.75** | 54.31 | 3 |
+| KNN, 20 vecinos | 131.82 | 115.11 | 76.41 | 1540 |
+| XGBoost | 133.45 | 106.61 | 67.66 | 7946 |
+| Random Forest | 138.01 | 115.58 | 70.30 | 700 |
+| SVR | 150.05 | 131.56 | 78.68 | 1531 |
+| Estacional ingenuo | 154.93 | 112.39 | **43.90** | 0 |
+
+**Entre los cuatro gana KNN por RMSE (131.8), casi empatado con XGBoost
+(133.5), que tiene el menor MAE (106.6).** Los cuatro le ganan al estacional
+ingenuo en RMSE, pero **ninguno al SARIMAX**: el mejor queda 18 mm por encima,
+con cientos o miles de "parámetros" frente a 3. En los modelos de tabla, los
+parámetros son lo que `contar_parametros` cuenta: datos guardados en KNN y
+SVR, nodos en los árboles.
+
+Hay un detalle que vale la pena decir. Con la primera rejilla, que en
+validación era un poco peor, el *backtest* daba un poco mejor (KNN 131.5,
+XGBoost 131.5, Random Forest 135.4). Se dejó la segunda, porque **la elección
+la hace la validación y no el *backtest***, y una diferencia de 2 a 3 mm entre
+rejillas es menor que lo que separa a los modelos.
+
+**El MAPE.** Los cuatro tienen un MAPE peor que el SARIMAX (67 a 79 % frente
+a 54 %). Al ser suaves, pronostican cerca del promedio en los meses secos, y
+ahí el error relativo se dispara. Es la misma lección de la sección 1: el
+MAPE castiga los meses de poca lluvia, y un modelo que se acerca al promedio
+la paga cara.
 
 ## 4. Aprendizaje profundo
 
